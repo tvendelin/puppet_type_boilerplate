@@ -120,6 +120,7 @@ sub puppet_provider{
   )
  ) . ' }';
  
+ no warnings;
  return << "EOP";
 Puppet::Type.type(:$args->{type}).provide( :$args->{provider} ) do
  
