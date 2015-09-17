@@ -1,0 +1,386 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Carp;
+#use Cwd;
+#use File::Find;
+#use File::Copy;
+#use File::Path qw(make_path);
+#use List::MoreUtils qw(uniq);
+use Getopt::Long qw(:config gnu_getopt);
+
+GetOptions(
+ "help|h|?"       => \my $help,
+ "libdir=s"       => \my $libdir,
+ "type=s"        => \my $type,
+ "param=s"        => \my $param,
+ "prop=s"        => \my $prop,
+ "array-prop=s"     => \my $array_prop,
+ "namevar=s"       => \my $namevar,
+ "provider=s"      => \my $provider,
+ "with-property-methods" => \my $with_property_methods,
+);
+
+help() and exit if( defined $help or ! defined $type );
+
+# Validate the input
+
+
+my( @type_body, @getters_and_setters );
+
+# Make the pieces of Puppet type and getters/setters for provider
+
+if( defined $namevar ){
+ push( @type_body, newparam( $namevar, 'isnamevar' ) );
+}
+else{
+ $namevar = 'name';
+ push( @type_body, newparam( $namevar ) );
+}
+
+foreach( comma_separated_to_a( $param )){
+ push( @type_body, newparam($_) );
+}
+
+foreach( comma_separated_to_a( $prop )){
+ push( @type_body, newproperty($_) );
+ push( @getters_and_setters, getter_and_setter( $_ ) );
+}
+
+foreach( comma_separated_to_a( $array_prop )){
+ push( @type_body, newproperty_array($_) );
+ push( @getters_and_setters, getter_and_setter( $_ ) );
+}
+
+# Put the pieces together and get a Puppet type definition
+my $puppet_type = puppet_type({type => $type, body => join("\n\n", @type_body)});
+
+# Make provider(s)
+
+my %puppet_provider;
+my $args = { type => $type };
+
+$args->{prop_meth} = join("\n", @getters_and_setters )
+ if $with_property_methods;
+
+foreach( comma_separated_to_a( $provider )){
+ $args->{provider} = $_;
+ $puppet_provider{$_} = puppet_provider( $args );
+}
+
+
+# Output
+
+if( ! defined $libdir ){
+ print "$puppet_type\n";
+ print join("\n\n", values %puppet_provider ), "\n\n";
+ print "# No --libdir provided, outputting to STDOUT\n\n";
+ exit;
+}
+
+my $type_dir = "${libdir}/puppet/type";
+my $provider_root_dir = "${libdir}/puppet/provider";
+
+foreach( $type_dir, $provider_root_dir ){
+ if( ! -d $_ ){
+  print "\nDirectory >$_< does not seem to exist, aborting\n\n";
+  exit 1;
+ }
+}
+
+# Write Puppet type file
+open( my $fh, '>', "$type_dir/${type}.rb" ) or die $!;
+print $fh $puppet_type, "\n";
+close $fh;
+
+my $provider_dir = "$provider_root_dir/$type";
+mkdir $provider_dir or die $! if ! -d $provider_dir;
+
+foreach my $provider ( keys %puppet_provider ){
+ open( my $fh, '>', "$provider_dir/${provider}.rb" ) or die $!;
+ print $fh $puppet_provider{$provider}, "\n";
+ close $fh;
+}
+
+sub comma_separated_to_a{
+ my $str = shift or return;
+ return split( ',',  $str );
+}
+
+sub puppet_provider{
+ my $args = shift;
+ my $plural = $args->{type} . 's';
+ my $get_instances_method = "get_$plural";
+ my $arg_to_instances = '{ ' . join(', ', ':ensure => :present',
+  map{ ":$_ => <value>" } (
+   $namevar,
+   comma_separated_to_a( $param ),
+   comma_separated_to_a( $prop ),
+   comma_separated_to_a( $array_prop )
+  )
+ ) . ' }';
+ 
+ return << "EOP";
+Puppet::Type.type(:$args->{type}).provide( :$args->{provider} ) do
+ 
+ # Shell executables
+ # commands :some_name_of_your_choice => '<full path to an executable>'
+ # commands :another_name_of_your_choice => '<full path to an executable>'
+ 
+ # confine :operatingsystem => [:redhat, :centos]
+ # confine :feature => <your_custom_feature>
+ 
+ # This generates \@property_hash based getter and setter methods
+ # for each property
+ mk_resource_methods
+ 
+ def create
+  # TODO: something creative
+  # If you are creating in flush method, leave empty+
+ end
+ 
+ def destroy
+  # TODO: something destructive, like:
+  \@property_hash[:ensure] == :absent
+ end
+ 
+ def exists?
+  # Check for existence of the resource instance on the system
+  \@property_hash[:ensure] == :present
+ end
+ 
+ def self.instances
+  get_$get_instances_method.map{ |inst| new( inst ) }  
+ end
+ 
+ def self.prefetch( resources )
+  instances.each do |prov|
+   if resource = resources[prov.$namevar]
+    resource.provider = prov
+   end
+  end
+ end
+ 
+$args->{prop_meth}
+ 
+ def flush
+  if ! \@property_hash.key?(:ensure)
+   # Creating
+  elsif \@property_hash[:ensure] == :present
+   # Modifying
+   elsif \@property_hash[:ensure] == :absent
+   # Destroying
+   end
+ end
+ 
+ # The name of this class instance method is entirely up to you
+ # Just remember to prepend the method name with 'self.'
+ def self.$get_instances_method
+  $plural = []
+  
+  # TODO: whatever fetches your resource instances from the system.
+  # For each instance, create a hash and push it into $plural array:
+  # $plural << $arg_to_instances
+  
+  # ... and return the array when done
+  return $plural
+ end
+ 
+end
+EOP
+}
+
+sub getter_and_setter{
+ my $prop = shift;
+ 
+ return << "EOT";
+ def $prop
+  \@property_hash[:$prop]
+ end
+ 
+ def ${prop}=(newvalue)
+  \@property_hash[:$prop] = newvalue
+ end
+EOT
+}
+
+sub puppet_type{
+ my $args = shift;
+ 
+ return << "EOT";
+Puppet::Type.newtype(:$args->{type}) do 
+ ensurable
+ 
+ desc 'This describes the Puppet type $args->{type}'
+
+$args->{body}
+end
+EOT
+}
+
+sub newproperty{
+ my $prop = shift;
+ 
+ return << "EOP";
+ newproperty(:$prop) do
+  desc 'This describes a property "$prop"'
+  
+  validate do |value|
+   # TODO: validation
+   # 
+  end
+  
+  # Remove if you do not need to munge the catalog values, 
+  # or change if you do. This happans AFTER the validation.
+  munge do |value|
+   value
+  end
+  
+  #defaultto "A default value goes here"
+  
+ end
+EOP
+}
+
+sub newproperty_array{
+ my $prop = shift;
+ 
+ return << "EOP";
+ newproperty(:$prop, :array_matching => :all) do
+  desc 'This describes a property "$prop"'
+  
+  # IMPORTANT:
+  # validation and munging is performed on each array member in turn
+  # NOT on an array as such
+  
+  validate do |value|
+   # TODO: validation
+   # 
+  end
+  
+  # Remove if you do not need to munge the catalog values, 
+  # or change if you do. This happans AFTER the validation.
+  munge do |value|
+   value
+  end
+  
+  # This sets equality definition between 'is' and 'should' values
+  # If you are happy with the default, remove the entire method.
+  def insync?(is)
+    Puppet.debug 'Insyncing $prop...'
+    
+    # The default behavior.
+    return true if( is == should )
+    
+    # Arrays to be considered 'equal' regardless of the elements' order
+    #return true if( is.sort == should.sort )
+    
+    Puppet.debug "Not in sync: $prop"
+    return false
+   end
+ end
+EOP
+}
+
+sub newparam{
+ my $param = shift;
+ my $isnamevar = shift;
+ $isnamevar = defined $isnamevar ? "\n\t\tisnamevar\n" : '';
+ 
+ return << "EOP";
+ newparam(:$param) do
+  desc 'This describes a parameter "$param"'
+  $isnamevar
+  validate do |value|
+   # TODO: validation
+   # 
+  end
+ end
+EOP
+}
+
+sub help{
+ my $script = __FILE__;
+ 
+ print << "EOH";
+
+ USAGE:
+ 
+  $script --type <custom resource type>[ <other options, see below>]
+  $script --help
+ 
+EOH
+  print << 'EOH';
+ This script writes boileplate code for custom Puppet types and providers.
+ It saves you some typing, but you will still have to write your own 
+ code in Ruby, and, more generally, to understand what you are doing.
+ 
+ The most likely scenario is assumed: an 'ensurable' type with default
+ options for 'ensure' property (:present and :absent), and simple
+ prefetch/flush providers.
+ 
+ Options:
+ 
+  --type
+    The name of your custom Puppet resource type. Mandatory.
+    
+  --param
+    A comma-separated list of this type's parameters except
+    the 'namevar'. NO SPACES. Example:
+    --param host,port,protocol
+    
+  --prop
+    A comma-separated list of this type's properties except
+    those whose values are arrays. NO SPACES. Example:
+    --prop host,port,protocol
+    
+  --array-prop
+    A comma-separated list of this type's properties whose values 
+    are arrays. NO SPACES. Example:
+    --array-prop user_tags,user_roles
+    
+  --namevar
+    The spacial 'namevar' parameter that will be used for a resource
+    identifier. If omited, defaults to 'name'.
+    
+  --provider
+    A comma-separated list of provider names for this particular type
+    
+  --with-property-methods
+    Will write out getter and setter methods for each property in
+    each provider as generated by mk_resource_methods. This is only
+    necessary if you are going to change them, otherwise this
+    option should be omited. Note that explicitly defined getter 
+    and setter methods take precedence over those generated with
+    mk_resource_methods, which allows you to partially override them.
+    
+  --libdir
+    The root directory for Puppet extensions. Typically
+    $environment/modules/<a module>/lib
+    If omited, the code is printed to STDOUT.
+    
+  --help, -h, -?
+    Prints this message
+  
+EOH
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
